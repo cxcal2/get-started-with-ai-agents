@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 import logging
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-from azure.ai.projects.models import AgentVersionObject, AgentReference
+from azure.ai.projects.models import AgentVersionDetails
 from openai.types.conversations.message import Message
 from openai.types.responses import ResponseOutputMessage
 from openai.types.conversations import Conversation
@@ -43,6 +43,18 @@ tracer = trace.get_tracer(__name__)
 # Define the directory for your templates.
 directory = os.path.join(os.path.dirname(__file__), "templates")
 templates = Jinja2Templates(directory=directory)
+
+# Static asset used to derive a cache-busting version stamp. Tied to the
+# built React bundle so every rebuild invalidates browser-cached assets.
+_ASSET_STAMP_FILE = os.path.join(
+    os.path.dirname(__file__), "static", "react", "assets", "main-react-app.js"
+)
+
+def _get_asset_version() -> str:
+    try:
+        return str(int(os.path.getmtime(_ASSET_STAMP_FILE)))
+    except OSError:
+        return "0"
 
 # Create a new FastAPI router
 router = fastapi.APIRouter()
@@ -92,8 +104,8 @@ def cleanup_created_at_metadata(metadata: Mapping[str, str]) -> None:
 def get_project_client(request: Request) -> AIProjectClient:
     return request.app.state.ai_project
 
-def get_agent_version_obj(request: Request) -> AgentVersionObject:
-    return request.app.state.agent_version_obj
+def get_agent_version_details(request: Request) -> AgentVersionDetails:
+    return request.app.state.agent_version_details
 
 def get_openai_client(request: Request) -> AsyncOpenAI:
     return get_project_client(request).get_openai_client()
@@ -168,10 +180,9 @@ async def get_message_and_annotations(event: Message | ResponseOutputMessage) ->
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, _ = auth_dependency):
     return templates.TemplateResponse(
-        "index.html", 
-        {
-            "request": request,
-        }
+        request,
+        "index.html",
+        {"asset_version": _get_asset_version()},
     )
 
 async def save_user_message_created_at(openai_client: AsyncOpenAI, conversation: Conversation,  input_created_at: float):
@@ -199,7 +210,7 @@ async def save_user_message_created_at(openai_client: AsyncOpenAI, conversation:
 
 
 async def get_result(
-    agent: AgentVersionObject,
+    agent: AgentVersionDetails,
     conversation: Conversation,
     user_message: str, 
     project_client: AIProjectClient,
@@ -211,26 +222,33 @@ async def get_result(
             logger.info(f"get_result invoked for conversation={conversation.id}")
             input_created_at = datetime.now(timezone.utc).timestamp()
             try:
-                response = await openai_client.responses.create(
+                async with openai_client.responses.stream(
                     conversation=conversation.id,
                     input=user_message,
-                    extra_body={"agent": AgentReference(name=agent.name, version=agent.version).as_dict()},
-                    stream=True
-                )
-                logger.info("Successfully created stream; starting to process events")
-                async for event in response:
-                    if event.type == "response.created":
-                        logger.info(f"Stream response created with ID: {event.response.id}")
-                    elif event.type == "response.output_text.delta":
-                        logger.info(f"Delta: {event.delta}")
-                        stream_data = {'content': event.delta, 'type': "message"}
-                        yield serialize_sse_event(stream_data)
-                    elif event.type == "response.output_item.done" and event.item.type == "message":
-                        stream_data = await get_message_and_annotations(event.item)
-                        stream_data['type'] = "completed_message"
-                        yield serialize_sse_event(stream_data)
-                    elif event.type == "response.completed":
-                        logger.info(f"Response completed with full message: {event.response.output_text}")
+                    extra_body={"agent_reference": {"name": agent.name, "type": "agent_reference"}},
+                    model=os.environ["AZURE_AI_AGENT_DEPLOYMENT_NAME"]
+                ) as stream:
+                    logger.info("Successfully created stream; starting to process events")
+                    stream_started_at = datetime.now(timezone.utc).timestamp()
+                    async for event in stream:
+                        elapsed_ms = int((datetime.now(timezone.utc).timestamp() - stream_started_at) * 1000)
+                        logger.info(f"[+{elapsed_ms}ms] event: {event.type}")
+                        if event.type == "response.created":
+                            logger.info(f"Stream response created with ID: {event.response.id}")
+                            # Emit an early "thinking" event so the browser flushes buffers
+                            # and can render a progress indicator during model reasoning.
+                            yield serialize_sse_event({'content': '', 'type': "message"})
+                        elif event.type == "response.output_text.delta":
+                            logger.info(f"Delta: {event.delta}")
+                            stream_data = {'content': event.delta, 'type': "message"}
+                            yield serialize_sse_event(stream_data)
+                        elif event.type == "response.output_item.done" and event.item.type == "message":
+                            stream_data = await get_message_and_annotations(event.item)
+                            stream_data['type'] = "completed_message"
+                            yield serialize_sse_event(stream_data)
+
+                    final_response = await stream.get_final_response()
+                    logger.info(f"Response completed with full message: {final_response.output_text}")
                                                         
             except Exception as e:
                 logger.exception(f"Exception in get_result: {e}")
@@ -250,7 +268,7 @@ async def get_result(
 @router.get("/chat/history")
 async def history(
     request: Request,
-    agent: AgentVersionObject = Depends(get_agent_version_obj),
+    agent: AgentVersionDetails = Depends(get_agent_version_details),
     openai_client : AsyncOpenAI = Depends(get_openai_client),
 	_ = auth_dependency
 ):
@@ -289,21 +307,21 @@ async def history(
 
 @router.get("/agent")
 async def get_chat_agent(
-    agent: AgentVersionObject = Depends(get_agent_version_obj),
+    agent: AgentVersionDetails = Depends(get_agent_version_details),
 ):
     wsid = os.environ.get("AZURE_EXISTING_AIPROJECT_RESOURCE_ID")
     agent_id = os.environ.get("AZURE_EXISTING_AGENT_ID")
     agent_name = agent_id.split(":")[0]
     agent_version = agent_id.split(":")[1]
     agent_playground_url = f"https://ai.azure.com/nextgen/r/{encode_project_resource_id(wsid)}/build/agents/{quote(agent_name)}/build?version={agent_version}"
-    return JSONResponse(content={"name": agent.name, "metadata": agent.metadata, "agentPlaygroundUrl": agent_playground_url})
+    return JSONResponse(content={"name": agent.name, "version": agent.version, "metadata": agent.metadata, "agentPlaygroundUrl": agent_playground_url})
 
 
 @router.post("/chat")
 async def chat(
     request: Request,
     project_client: AIProjectClient = Depends(get_project_client),
-    agent: AgentVersionObject = Depends(get_agent_version_obj),
+    agent: AgentVersionDetails = Depends(get_agent_version_details),
     
 	_ = auth_dependency
 ):

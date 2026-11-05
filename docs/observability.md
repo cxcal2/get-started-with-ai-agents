@@ -6,9 +6,9 @@ In **pre-deployment** stage, you can leverage [Agent Evaluation](#agent-evaluati
 
 In **post-deployment** stage, you can utilize [Tracing and monitoring](#tracing-and-monitoring) and [Continuous Evaluation](#continuous-evaluation) capabilities to maintain ongoing visibility into your agent's performance and behavior in production. With the baselines established in pre-deployment, you can set up alerts for a desirable passing rate, so that you can review the failing traces that helps you quickly identify and address any issues that may arise, ensuring a consistent and high-quality user experience.
 
-## Prequisites 
+## Prequisites
 
-Execute `azd up` to generate most of these environment variables in `.azure/.env`. To specify the Agent ID, navigate to the Microsoft Foundry Portal:
+Execute `azd up` to generate most of these environment variables. `azd` writes them to `.azure/<your-azd-environment-name>/.env` (the file for the environment listed as `defaultEnvironment` in `.azure/config.json`). The evaluation and red teaming tests automatically load env vars from that file — no manual `.env` copy is required. To specify the Agent ID, navigate to the Microsoft Foundry Portal:
 
   1. Go to [Microsoft Foundry Portal](https://ai.azure.com/) and sign in
   2. Click on your project from the homepage
@@ -113,6 +113,9 @@ Once App Insights is connected to your foundry project, you can also visit the m
 Continuous evaluation is an automated monitoring capability that continuously assesses your agent's quality, performance, and safety as it handles real user interactions in production.
 
 During container startup, continuous evaluation is `enabled` by default and pre-configured with a sample evaluator set to evaluate up to `5` agent responses per hour. Continuous evaluation does not generate test inputs—instead, it evaluates real user conversations as they occur. This means evaluation runs are triggered only when actual users interact with your agent, and if there are no user interactions, there will be no evaluation entries.
+
+> [!IMPORTANT]
+> The default `builtin.violence` evaluator is a risk and safety evaluator. It is supported only when the Microsoft Foundry project is in **East US 2, North Central US, France Central, Sweden Central, Switzerland West, Germany West Central, or Australia East**. In other regions, the evaluation rule can be created, but its evaluation runs fail. Choose a supported project region or replace the evaluator before relying on continuous evaluation.
 
 To customize continuous evaluation from the Microsoft Foundry:
 
